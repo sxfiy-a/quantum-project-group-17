@@ -32,7 +32,28 @@ class BaselinePolicy:
                 sim.swap(left, right)
 
 
+class FreshestPolicy:
+    """swap the NEWEST pair on each side, never purify."""
+
+    def __init__(self, params):
+        self.params = params
+        self.chains = params["policy"]["swap_chains"]
+
+    def on_pair_ready(self, link, pair, state, sim):
+        # for our network: left=0 (fast link), right=1 (slow link)
+        for left, right in self.chains:
+            # waiting pairs on each side (empty list if none)
+            left_pairs = state.pairs.get(left, [])
+            right_pairs = state.pairs.get(right, [])
+            # need one pair on each side to swap
+            if left_pairs and right_pairs:
+                # last index = newest pair (lists are oldest-first)
+                sim.swap(left, right,
+                         left_index=len(left_pairs) - 1,
+                         right_index=len(right_pairs) - 1)
+
+
 def make_policy(params):
     """Return your policy object. Replace BaselinePolicy with your own class
     (same constructor signature and on_pair_ready hook)."""
-    return BaselinePolicy(params)
+    return FreshestPolicy(params)
