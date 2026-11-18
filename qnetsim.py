@@ -47,7 +47,10 @@ class EventQueue:
 
 
 def decay_fidelity(f0: float, dt: float, t2: float) -> float:
-    """Depolarising decay of Bell-pair fidelity toward the 1/4 floor.
+    """
+    💡It starts at F0 and slides toward 0.25,
+
+    Depolarising decay of Bell-pair fidelity toward the 1/4 floor.
     dt in the same time units as t2 (milliseconds throughout the harness)."""
     if t2 is None or math.isinf(t2):
         return f0
@@ -57,6 +60,8 @@ def decay_fidelity(f0: float, dt: float, t2: float) -> float:
 def bbpssw(f: float):
     """One recurrence round on two identical depolarising pairs of fidelity f.
     Returns (F', P_success)."""
+
+    # 💡 bbpssw is one round of entanglement purification
     e = (1.0 - f) / 3.0
     p_succ = f * f + 2 * f * e + 5 * e * e
     f_out = (f * f + e * e) / p_succ
@@ -98,9 +103,9 @@ class NetworkState:
     """Live inventory handed to the policy at each event."""
     now: float
     pairs: dict = field(default_factory=dict)   # link_id -> [Pair]
-    t2: float = math.inf
-    q_swap: float = 1.0
-    f_swap: float = 1.0
+    t2: float = math.inf    # 💡quantum memory coherence time, default infinite, no decay
+    q_swap: float = 1.0     # 💡swap success reate, default 100% 
+    f_swap: float = 1.0     # 💡swap fidelity factor, default 100%, used in line 195
     purification_allowed: bool = False
     rng: object = None
     stats: dict = field(default_factory=lambda: {
@@ -139,19 +144,26 @@ class Simulator:
         self._schedule_next_attempt(link_id, 0.0)
 
     def _schedule_next_attempt(self, link_id, now):
+        # 💡 random interval to meet 21 pairs / s generation rate
+
         link = self.links[link_id]
         dt = self.rng.exponential(1.0 / link.attempt_rate)  # ms
+        # 💡 push (time, callback, payload)
         self.eq.push(now + dt, self._on_attempt, link_id)
 
     def _on_attempt(self, link_id):
         link = self.links[link_id]
         now = self.state.now
+        # 💡 random number to simulate succ/fail
         if self.rng.random() < link.p_success:
+            # 💡 append to the end, and update tracking
             pair = Pair(link_id=link_id, born=now, f0=link.f_link)
             self.state.pairs.setdefault(link_id, []).append(pair)
             self.state.stats["generated"] += 1
+            # 💡 if policy, call policy specific action
             if self.policy is not None:
                 self.policy.on_pair_ready(link, pair, self.state, self)
+        # 💡 new try
         self._schedule_next_attempt(link_id, now)
 
     # -- operations available to the policy ---------------------------
@@ -159,15 +171,26 @@ class Simulator:
     def purify(self, link_id):
         """Consume the two oldest pairs on link_id; on success replace them
         with one purified pair. Returns True on success."""
+        # 💡 get pair list of link_id
         inv = self.state.pairs.get(link_id, [])
+        
+
         if len(inv) < 2:
             return False
+        # 💡 get two oldest
+
         p1, p2 = inv.pop(0), inv.pop(0)
         now = self.state.now
+        # 💡 get lowest fidelity
         f_now = min(self.state.current_fidelity(p1),
                     self.state.current_fidelity(p2))
+        
+        # 💡 p_succ: purify success rate, f_out: if success, new fidelity
         f_out, p_succ = bbpssw(f_now)
+
+        # 💡 random number to simulate succ/fail (purification)
         if self.rng.random() < p_succ:
+            # 💡 append to the end, and update tracking
             inv.append(Pair(link_id=link_id, born=now, f0=f_out))
             self.state.stats["purified_ok"] += 1
             return True
@@ -183,14 +206,19 @@ class Simulator:
         rin = self.state.pairs.get(right_link_id, [])
         if not lin or not rin:
             return None
+
+        # 💡 if we pass lindex / rindex explicitly, we get these two pairs
         pl = lin.pop(min(left_index, len(lin) - 1))
         pr = rin.pop(min(right_index, len(rin) - 1))
         now = self.state.now
+        # 💡 random number to simulate succ/fail (swap)
         if self.rng.random() < self.state.q_swap:
+            # 💡f = fidelity(left pair) × fidelity(right pair) × f_swap
             f = (self.state.current_fidelity(pl)
                  * self.state.current_fidelity(pr)
                  * self.state.f_swap)
             self.state.stats["swapped_ok"] += 1
+            # 💡 swap success, add to delivered list with request_id(if any, -1 for unassigned)
             self.delivered.append(DeliveredPair(
                 request_id=request_id if request_id is not None else -1,
                 delivered_at=now, fidelity=f, consumed=2))
@@ -208,8 +236,10 @@ class Simulator:
 
     def run(self, sim_time_ms, policy=None):
         self.policy = policy
+        # 💡 start link (which pushes one pair to link)
         for link_id in self.links:
             self.start_link(link_id)
+        # 💡 continue processing 
         while len(self.eq):
             t, _, cb, payload = self.eq.pop()
             if t > sim_time_ms:
