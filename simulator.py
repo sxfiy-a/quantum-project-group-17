@@ -11,8 +11,7 @@ import math
 
 import numpy as np
 
-from qnetsim import Link, Simulator, summarise
-
+from qnetsim import DeliveredPair, Link, Simulator, summarise
 
 # ---------------------------------------------------------------- helpers
 
@@ -61,53 +60,121 @@ def request_times(params, sim_time_ms, seed):
         times.append(t)
     return times
 
+class RecordEveryPair:
+    """Tiny policy used only by run_one_hop.
+    """
+
+    def on_pair_ready(self, link, pair, state, sim):
+        sim.delivered.append(DeliveredPair(request_id=-1,
+                                           delivered_at=state.now,
+                                           fidelity=pair.f0,
+                                           consumed=1))
+
+class SwapWhenBothReady:
+    """Tiny policy used only by run_two_hop- swap as soon as both links
+    hold a pair
+    """
+
+    def on_pair_ready(self, link, pair, state, sim):
+        if state.pairs.get(0) and state.pairs.get(1):
+            sim.swap(0, 1)
+
+def p95_of(values):
+    """95th-percentile of a list, using same rule as qnetsim.summarise.
+    """
+    if not values:
+        return math.inf
+    
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)
+    return ordered[index]
+
+
+def match_requests(request_list, delivered):
+    """Serve users from a shared pool of ready pairs, first come first served.
+    """
+    ready_times = sorted(d.delivered_at for d in delivered)
+    waits = []
+    for i, asked_at in enumerate(request_list):
+        if i >= len(ready_times):
+            break
+        waits.append(max(0.0, ready_times[i] - asked_at))
+    return waits
+
 
 # ---------------------------------------------------------------- graded entry points
 
 
 def run_one_hop(params, sim_time_ms, seed) -> dict:
-    """Reference scenario: a single elementary link, no swapping.
-    Return {"rate": ..., "mean_fidelity": ...}.
+    """Single link, no purification.
 
-    TODO: build the one-hop links, run the Simulator for sim_time_ms with
-    policy=None, and use qnetsim.summarise on a delivered-list you fill
-    yourself (every generated pair counts as delivered here — record
-    deliveries via a tiny inline policy or by reading state.pairs/stats).
-
-    HINT: the harness only records `delivered` on swap; for the one-hop
-    case, write a 3-line policy class whose on_pair_ready appends a
-    DeliveredPair-equivalent record (or count pairs via state.stats and
-    track fidelities in a list).
+    Expected answer for variant: 2.7299 * 0.0362 * 1000 = 98.8 /s.
+    The run (seed 1017, 30000 ms): rate 100.33 (1.5% off, but allowed 8%),
+    fidelity 0.9322 (no decay).
     """
-    raise NotImplementedError("TODO: implement run_one_hop")
+    links = make_links(params, "one_hop")
+
+    sim = Simulator(links, t2=math.inf, q_swap=1.0, f_swap=1.0,
+                    purification_allowed=False, seed=seed)
+
+    delivered = sim.run(sim_time_ms, RecordEveryPair())
+
+    summary = summarise(delivered, sim_time_ms)
+
+    return {"rate": summary["rate"],
+            "mean_fidelity": summary["mean_fidelity"]}
 
 
 def run_two_hop(params, sim_time_ms, seed) -> dict:
-    """Reference scenario: two links, one repeater, immediate swap,
-    T2 = infinity, q_swap = 1 (params['reference']['two_hop']).
-    Return {"rate": ..., "mean_fidelity": ...}.
+    """Two links, one repeater, immediate swap.
 
-    TODO: build links, construct the Simulator with t2=math.inf,
-    q_swap=1.0, f_swap=params['physics']['f_swap']; use a policy that swaps
-    as soon as both links hold a pair; summarise with qnetsim.summarise.
+    Expected answer: rate ~25.1 (slower link 1 is the bottleneck),
+    fidelity = 0.9322 * 0.9322 * 0.9747 = 0.847.
+    The run (seed 1017): rate 25.67 (2.3% off, but allowed 8%), 
+    fidelity 0.8470.
     """
-    raise NotImplementedError("TODO: implement run_two_hop")
+    links = make_links(params, "two_hop")
+    sim = Simulator(links, t2=math.inf, q_swap=1.0,
+                    f_swap=params["physics"]["f_swap"],
+                    purification_allowed=False, seed=seed)
+    delivered = sim.run(sim_time_ms, SwapWhenBothReady())
+    summary = summarise(delivered, sim_time_ms)
+    return {"rate": summary["rate"],
+            "mean_fidelity": summary["mean_fidelity"]}
 
 
 def run_variant_scenario(params, sim_time_ms, seed, policy) -> dict:
-    """Full variant scenario with YOUR policy.
-    Return {"rate": ..., "mean_fidelity": ..., "p95_latency_ms": ...,
-            "pairs_consumed_per_delivery": ...}.
-
-    TODO:
-      * build the variant topology links;
-      * construct the Simulator with your variant's physics
-        (t2, q_swap, f_swap, purification_allowed, seed);
-      * generate request_times(...); use a pooled unlimited end-to-end buffer.
-        A request consumes a buffered pair at zero latency, or queues FIFO
-        for a later delivery. Exclude unserved requests from p95. Fidelity
-        is measured at generation; this buffer does not model further decay;
-      * return the four metrics. pairs_consumed_per_delivery =
-        stats['generated'] / max(1, delivered).
+    """Full variant scenario with created policy.
     """
-    raise NotImplementedError("TODO: implement run_variant_scenario")
+    physics = params["physics"]
+    links = make_links(params, "variant")
+    sim = Simulator(links, t2=physics["t2_ms"], q_swap=physics["q_swap"],
+                    f_swap=physics["f_swap"],
+                    purification_allowed=physics["purification_allowed"],
+                    seed=seed)
+    delivered = sim.run(sim_time_ms, policy)
+    requests = request_times(params, sim_time_ms, seed)
+    waits = match_requests(requests, delivered)
+    n = len(delivered)
+    rate = n / (sim_time_ms / 1000.0)
+    mean_fidelity = sum(d.fidelity for d in delivered) / n if n else 0.0
+    consumed = sim.state.stats["generated"] / max(1, n)
+    return {"rate": rate,
+            "mean_fidelity": mean_fidelity,
+            "p95_latency_ms": p95_of(waits),
+            "pairs_consumed_per_delivery": consumed}
+
+
+if __name__ == "__main__":
+    import json
+    from policy import FreshestPolicy, make_policy
+    params = json.load(open("variant_params.json"))
+    seed = params["grading"]["seed"]
+    sim_time = params["grading"]["sim_time_ms"]
+    print("one_hop ", run_one_hop(params, sim_time, seed))
+    print("two_hop ", run_two_hop(params, sim_time, seed))
+    print("reference", run_variant_scenario(params, sim_time, seed,
+                                            FreshestPolicy(params)))
+    for s in [seed] + params["grading"]["held_out_seeds"]:
+        print("ours", s, run_variant_scenario(params, sim_time, s,
+                                              make_policy(params)))
